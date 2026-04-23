@@ -229,9 +229,10 @@ export const engineClient = {
       'POST', `/api/v1/holds/${holdRef}/confirm`, body, idemKey,
     ),
 
-  /** §3.4 — cancel booked seats, returns them to inventory pool */
-  cancelSeats: (req: { trip_id: string; seats: { seat_no: string; leg_indexes: number[] }[]; reason: string }, idemKey = randomUUID()) =>
-    call<{ released: number }>('POST', '/api/v1/cancel-seats', req, idemKey),
+  /** §3.4 — cancel a single booked seat, returns it to inventory pool.
+   *  PER-SEAT (not batched). For multi-passenger bookings, call once per seat. */
+  cancelSeats: (req: { trip_id: string; seat_no: string; leg_indexes: number[] }, idemKey = randomUUID()) =>
+    call<{ success: boolean }>('POST', '/api/v1/cancel-seats', req, idemKey),
 
   /** §3.5 — read-only snapshot of seat inventory for a trip */
   inventory: (tripId: string) =>
@@ -349,17 +350,20 @@ await tx.update(seatInventory)
   ));
 ```
 
-**Becomes**:
+**Becomes** (per-seat — engine endpoint takes one seat per call; iterate when
+a booking has multiple passengers):
 ```ts
 // After updating the passenger / booking status rows in TransityTerminal's tx:
-await engineClient.cancelSeats({
-  trip_id: booking.tripId,
-  seats: [{ seat_no: passengerRow.seatNo, leg_indexes: legIndexes }],
-  reason: reason.trim(),
-});
+for (const passengerRow of cancelledPassengers) {
+  await engineClient.cancelSeats({
+    trip_id: booking.tripId,
+    seat_no: passengerRow.seatNo,
+    leg_indexes: legIndexes,
+  });
+}
 ```
 
-This works for all cancel paths: `unseatPassenger`, `unseatAllPassengers`, `cancelTicket`, `releasePendingBooking`, `cleanupExpiredPendingBookings`.
+This works for all cancel paths: `unseatPassenger`, `unseatAllPassengers`, `cancelTicket`, `releasePendingBooking`, `cleanupExpiredPendingBookings`. Each cancelled seat = one engine call.
 
 ### 5.5 Inventory snapshot (optional, useful for debug pages)
 
@@ -370,41 +374,53 @@ const snap = await engineClient.inventory(tripId);
 
 ---
 
-## 6. Migration Strategy (strangler-fig, contract §12)
+## 6. Migration Strategy (safe pattern for shared-DB topology)
 
-Do this over **3 deploys**, not one big-bang. Engine and Node code coexist throughout.
+> **Important**: traditional "shadow mode" (call both Node and engine for every
+> request, diff the results) is **NOT safe** here because both implementations
+> write to the same Postgres tables. Dual writes will create duplicate hold
+> rows, race the reapers, and emit duplicate WebSocket events. The rollout
+> below avoids that entirely.
 
-### Phase 1 — Shadow (no behavior change)
+### Phase 1 — Idle deployment (engine present, flag off)
 
-1. Deploy engine pointing at TransityTerminal's Postgres.
-2. Add the engine client (§4) but keep all existing Node code as the source of truth.
-3. After every Node `atomicHold()` / `releaseHoldByRef()` / `confirmSeatsBooked()` call, **also** call the corresponding engine endpoint and **diff the result asynchronously** (log mismatches, do not throw):
+1. Build/push the engine image. Add the engine sidecar to the pilot operator's
+   compose stack via `engine/deploy/docker-compose.engine.yml`.
+2. Set `RESERVATION_ENGINE_ENABLED=false` in that operator's `.env`.
+3. Restart the stack. Engine starts, healthcheck green, but TT does not call it.
+4. Soak for 1–3 days to confirm deployment topology, log shipping, healthcheck,
+   and resource footprint are stable.
 
-```ts
-const nodeResult = await this.atomicHoldService.atomicHold(req);
-queueMicrotask(async () => {
-  try {
-    const engineResult = await engineClient.hold(...);
-    diffAndLog('hold', nodeResult, engineResult);
-  } catch (e) { logShadowError(e); }
-});
-return nodeResult;
-```
+### Phase 2 — Canary cutover (per-operator)
 
-Run for 24–72 h, watch logs for mismatches. **Expect zero** — if any appear, root-cause before proceeding.
+1. Stage in dev/staging first: point a non-prod copy of the operator's stack at
+   a non-prod DB. Set `RESERVATION_ENGINE_ENABLED=true`. Run TT's existing test
+   suite plus the smoke flow (hold → confirm → release → cancel). Reproduce a
+   handful of real booking scenarios manually.
+2. Schedule a low-traffic window. Set `RESERVATION_ENGINE_ENABLED=true` in the
+   operator's production `.env`. Restart TT (~2s downtime).
+3. The scheduler's `cleanupExpiredHolds()` and `cleanupOrphanHoldRefs()` MUST
+   become a no-op when the flag is on (engine owns reaping). See
+   `engine/docs/TT_HOLDS_ADAPTER_INSTRUCTIONS.md` Step 4.
+4. Monitor for 7 days: error rate, p95 latency, `seat_holds` row count drift,
+   double-book reports.
 
-### Phase 2 — Canary cutover
+### Phase 3 — Cleanup (months later, optional)
 
-1. Add a feature flag `RESERVATION_ENGINE_ENABLED=true` (gate per-route or per-operator).
-2. When the flag is on, call the engine **as the primary**, skip the Node version.
-3. Keep the scheduler's `cleanupExpiredHolds()` and `cleanupOrphanHoldRefs()` **disabled** when the flag is on (engine has its own reaper).
-4. Roll out to 5% of traffic → 50% → 100%.
-
-### Phase 3 — Cleanup
-
-1. Delete `atomicHold.service.ts`, the seat-related parts of `holds.service.ts`, and the cleanup methods in `scheduler.ts`.
-2. Remove the feature flag.
+1. Once all relevant operators are stable on the engine, delete
+   `atomicHold.service.ts`, the seat-related parts of `holds.service.ts`, and
+   the cleanup methods in `scheduler.ts`.
+2. Keep the adapter as the single entry point. Remove the flag if no operator
+   is left on the Node path.
 3. Engine becomes the only writer to `seat_inventory` and `seat_holds`.
+
+### Optional: read-only post-write audit
+
+If you want a Phase-1 sanity signal before cutover without dual writes: after
+each successful Node hold/release/confirm, asynchronously call
+`GET /api/v1/inventory/:trip_id` on the engine and verify the engine's view of
+the changed seats matches the DB. This is racy and informational only — never
+call engine **write** endpoints in shadow.
 
 ---
 
@@ -486,8 +502,9 @@ Before merging the cutover PR:
 - [ ] Redis subscriber (`startEngineEventSubscriber`) running and forwarding events to Socket.io
 - [ ] `scheduler.ts` `cleanupExpiredHolds()` + `cleanupOrphanHoldRefs()` disabled (engine reaper handles both)
 - [ ] Direct `seat_inventory` / `seat_holds` writes in non-engine code: zero (grep `seat_inventory\\.` and `seat_holds\\.` — should only return reads after cutover)
-- [ ] Feature flag `RESERVATION_ENGINE_ENABLED` rolled out gradually
-- [ ] Shadow-diff log shows zero mismatches over the canary window
+- [ ] Feature flag `RESERVATION_ENGINE_ENABLED` set per operator (declarative)
+- [ ] Engine sidecar soaked idle (flag off) for ≥1 day with healthcheck green
+- [ ] Staging smoke flow (hold → confirm → release → cancel) passed with flag on
 - [ ] `precomputeInventory()` continues to seed rows; engine reads but does not seed
 
 ---
@@ -566,3 +583,49 @@ errors:  0
 ```
 
 Tweak `--scenario hold-confirm` to test confirm path, or `--seats 50 --concurrency 200` to force heavy contention.
+
+---
+
+## 14. Per-operator deployment (sidecar)
+
+The recommended deployment model is a **per-operator sidecar**: each
+TransityTerminal instance is paired with one engine container on the same
+Docker network, on the same host. They share the operator's Postgres database.
+
+```
+[Operator VM]
+  ├── transity-terminal-<slug>    (Node, port 5000 → 127.0.0.1:HOST_PORT)
+  └── transity-engine-<slug>      (Rust, port 8000 → internal only)
+        ↓ shared
+        ENGINE_DATABASE_URL = DATABASE_URL  (same Neon project as TT)
+```
+
+**Key properties:**
+- Engine ↔ TT latency: ~1–3 ms (loopback / Docker bridge).
+- Engine is **not** exposed to the host network, only to `terminal` via the
+  internal compose DNS (`http://engine:8000`).
+- Engine resource cost: ~50 MB RAM, ~5% one core peak. Negligible per host.
+- The flag `RESERVATION_ENGINE_ENABLED=true|false` is **per-operator**,
+  declarative, and requires a TT restart to flip. Do NOT auto-switch based
+  on traffic — state asymmetry (idempotency, reaper, event emit) makes
+  mid-traffic switching unsafe.
+- For small operators (< 1 k bookings/day, < 5 concurrent CSO), **skip the
+  engine** entirely. The flag stays `false` and the engine container does
+  not need to be deployed for that operator.
+
+**Files:**
+- `engine/Dockerfile` — multi-stage Rust build → minimal Debian runtime.
+- `engine/deploy/docker-compose.engine.yml` — overlay that layers on top of
+  TT's existing `docker-compose.yml` to add the engine service and inject
+  the engine env vars into `terminal`.
+- `engine/deploy/.env.engine.example` — template env vars (HMAC secret,
+  feature flag, image tag, hold TTLs, reaper interval).
+- `engine/deploy/README.md` — full per-operator setup walkthrough,
+  rollout & rollback drills, ops notes.
+
+**TT codebase changes:**
+- `engine/docs/TT_HOLDS_ADAPTER_INSTRUCTIONS.md` — copy-pasteable change set
+  for the agent / engineer who will integrate the `holdsAdapter` into TT.
+  Includes file layout, snippets for `engineClient.ts` and `holdsAdapter.ts`,
+  the scheduler reaper guard, a verification checklist, and the safe
+  shared-DB rollout sequence (no dual-write shadow mode).

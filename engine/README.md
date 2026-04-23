@@ -125,11 +125,17 @@ Release flows always emit `inventory.updated` **before** `holds.released`
 (contract §9.7). Publish failures are logged but never roll back the
 transaction — the database is the source of truth.
 
-## Migration Strategy (contract §12)
+## Migration Strategy
 
-This crate is engineered to slot into the strangler-fig rollout:
+This crate is engineered to slot in via per-operator sidecar deployment with a
+declarative feature flag in TT (`RESERVATION_ENGINE_ENABLED`). See
+`docs/TRANSITY_TERMINAL_INTEGRATION.md` §6 and
+`docs/TT_HOLDS_ADAPTER_INSTRUCTIONS.md` §6 for the full rollout sequence.
 
-1. **Shadow** — point Node at engine via mirror traffic, compare results.
-2. **Canary** — switch one outlet's hold/release to the engine.
-3. **Cutover holds & releases**, then **confirm & cancel**.
-4. **Cleanup** — leave Node endpoints as thin proxies.
+1. **Idle deploy** — engine sidecar runs alongside TT, flag off, 1–3 day soak.
+2. **Staging cutover** — flag on against staging DB, run smoke flow.
+3. **Production cutover** — flag on per operator during low-traffic window.
+4. **Cleanup** — months later, delete the Node atomic-hold path from TT.
+
+Note: traditional dual-write shadow mode is **not** safe here because both
+implementations write to the same Postgres tables. See the integration doc.

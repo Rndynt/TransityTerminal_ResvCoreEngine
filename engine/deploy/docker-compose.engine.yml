@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────
+# Reservation Engine sidecar overlay for TransityTerminal
+# ─────────────────────────────────────────────
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.engine.yml up -d
+#
+# This file LAYERS on top of TransityTerminal's existing docker-compose.yml.
+# It does not replace it. The `terminal` service is augmented with engine
+# discovery env vars. A new `engine` service is added on the same network.
+#
+# Engine is NOT exposed to the host — only TT inside the same compose
+# network can reach it via `http://engine:8000`.
+#
+# IMPORTANT: there is intentionally no `depends_on` between terminal and
+# engine. TT must start independently of the engine so that operators with
+# RESERVATION_ENGINE_ENABLED=false (or a temporarily unhealthy engine) are
+# never blocked. When the flag is true and the engine is briefly unavailable,
+# TT requests will fail fast with a 5xx error — operationally acceptable and
+# easier to debug than a stuck startup.
+# ─────────────────────────────────────────────
+
+services:
+  terminal:
+    environment:
+      - RESERVATION_ENGINE_ENABLED=${RESERVATION_ENGINE_ENABLED:-false}
+      - RESERVATION_ENGINE_URL=http://engine:8000
+      - RESERVATION_ENGINE_HMAC_SECRET=${RESERVATION_ENGINE_HMAC_SECRET}
+
+  engine:
+    image: transity-engine:${ENGINE_IMAGE_TAG:-latest}
+    container_name: transity-engine-${OPERATOR_SLUG}
+    restart: unless-stopped
+    # No host port — only `terminal` reaches us via the internal network.
+    expose:
+      - "8000"
+    environment:
+      # === Bind ===========================================================
+      - HOST=0.0.0.0
+      - PORT=8000
+      - RUST_LOG=${ENGINE_LOG_LEVEL:-info}
+      # === Database (defaults to TT's DATABASE_URL — same Postgres) =======
+      - ENGINE_DATABASE_URL=${ENGINE_DATABASE_URL:-${DATABASE_URL}}
+      # === HMAC ===========================================================
+      # MUST match the value TT signs with. Same env var name on both sides.
+      - RESERVATION_ENGINE_HMAC_SECRET=${RESERVATION_ENGINE_HMAC_SECRET}
+      - HMAC_SKEW_SECS=${HMAC_SKEW_SECS:-30}
+      # === Reaper =========================================================
+      - REAPER_INTERVAL_SECS=${REAPER_INTERVAL_SECS:-60}
+      # === Connection pool ================================================
+      - DB_MIN_CONN=${DB_MIN_CONN:-2}
+      - DB_MAX_CONN=${DB_MAX_CONN:-10}
+      # === Idempotency cache ==============================================
+      - IDEMPOTENCY_MAX=${IDEMPOTENCY_MAX:-10000}
+      # === Optional Redis pub/sub for inventory.updated / holds.released ==
+      # Leave unset to disable event publication.
+      - REDIS_URL=${REDIS_URL:-}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8000/api/v1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - transity-terminals-net
+
+networks:
+  transity-terminals-net:
+    external: true
+    name: transity-terminals-net

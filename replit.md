@@ -36,6 +36,19 @@ Reads/writes synthetic seats (prefix `LT-<run>-`) on a discovered trip; reports
 p50/p95/p99 + conflict counts. Sanity-checked against live engine, 0 errors,
 correct conflict resolution under contention.
 
+**Deployment** (per-operator sidecar): `engine/Dockerfile` + `engine/deploy/`
+(docker-compose overlay, `.env` template, README). Each operator runs
+TT + engine on the same Docker network sharing one Postgres DB. Engine is
+internal-only (`http://engine:8000`). Activation is declarative via
+`RESERVATION_ENGINE_ENABLED=true|false` per operator's `.env` (requires TT
+restart). Small operators stay on pure Node and don't deploy the engine.
+
+**TT-side adapter**: `engine/docs/TT_HOLDS_ADAPTER_INSTRUCTIONS.md` — prescriptive
+change set (not auto-applied) for the agent that will modify the
+TransityTerminal repo to introduce `holdsAdapter.ts`, the feature-flag
+dispatcher between Node `AtomicHoldService` and the engine, plus shadow-mode
+diff logger and scheduler reaper guard.
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages
