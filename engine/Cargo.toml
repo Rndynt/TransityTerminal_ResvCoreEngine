@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine-core", "crates/engine-server"]
+members = ["crates/engine-core", "crates/engine-server", "loadtest"]
 
 [workspace.package]
 version = "0.1.0"

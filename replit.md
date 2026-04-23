@@ -22,8 +22,19 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 1:1 port of TransityTerminal reservation engine per the v1.0 contract
 (`attached_assets/RESERVATION_ENGINE_CONTRACT_*.md`). Cargo workspace with
 `engine-core` (domain logic) + `engine-server` (Axum HTTP, HMAC, idempotency,
-60s reaper task). Migrations in `engine/migrations/`. Full parity test suite
-in `engine/crates/engine-core/tests/parity.rs`. See `engine/README.md`.
+60s reaper task) + `loadtest` (HTTP load test bin). Migrations in
+`engine/migrations/`. Full parity test suite in
+`engine/crates/engine-core/tests/parity.rs`. See `engine/README.md`.
+
+**Integration**: `engine/docs/TRANSITY_TERMINAL_INTEGRATION.md` — file-by-file
+migration guide for the TransityTerminal Node app (engine client, HMAC signer,
+WebSocket subscriber, strangler-fig rollout, error mapping).
+HMAC signs `{ts_seconds}.{METHOD}.{path}.{sha256(body)}`.
+
+**Load test**: `cargo run -p loadtest -- --scenario hold-release|hold-confirm`.
+Reads/writes synthetic seats (prefix `LT-<run>-`) on a discovered trip; reports
+p50/p95/p99 + conflict counts. Sanity-checked against live engine, 0 errors,
+correct conflict resolution under contention.
 
 ## Key Commands
 
