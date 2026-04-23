@@ -29,7 +29,7 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd engine && PORT=8000 RESERVATION_ENGINE_HMAC_SECRET=dev_secret_change_me_please_32chars cargo run -p engine-server"
+args = "cd engine && PORT=8000 cargo run -p engine-server"
 waitForPort = 8000
 
 [agent]
@@ -39,6 +39,10 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[[ports]]
+localPort = 5173
+externalPort = 5173
 
 [[ports]]
 localPort = 8000
@@ -51,3 +55,8 @@ externalPort = 8080
 [[ports]]
 localPort = 8081
 externalPort = 80
+
+[userenv]
+
+[userenv.shared]
+RESERVATION_ENGINE_HMAC_SECRET = "035402f8163cdef79932b29e5ff00a1bb7ad2372d3fc3a78e52a166a78103a64"

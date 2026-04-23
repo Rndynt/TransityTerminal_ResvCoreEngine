@@ -20,8 +20,11 @@ impl Config {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let bind_addr = format!("{host}:{port}");
 
-        let database_url = env::var("DATABASE_URL")
-            .map_err(|_| anyhow!("DATABASE_URL must be set"))?;
+        // Prefer ENGINE_DATABASE_URL (e.g. Neon) over the workspace's
+        // managed DATABASE_URL so the engine can target an external Postgres.
+        let database_url = env::var("ENGINE_DATABASE_URL")
+            .or_else(|_| env::var("DATABASE_URL"))
+            .map_err(|_| anyhow!("ENGINE_DATABASE_URL or DATABASE_URL must be set"))?;
 
         let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
 
