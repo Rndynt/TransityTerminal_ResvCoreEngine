@@ -1,0 +1,204 @@
+# Code Review — TransityTerminal Rust Reservation Engine
+
+> Dibandingkan terhadap TransityTerminal (Node.js) terbaru · April 2026
+
+---
+
+## Verdict Keseluruhan
+
+**Sangat solid. Ini bukan prototipe — ini production-grade code.**
+
+Arsitektur dua-crate bersih, keamanan HMAC diimplementasi dengan benar hingga constant-time comparison, ada deadlock fix yang justru tidak ada di Node.js-nya, reaper menggunakan advisory lock yang lebih baik, dan ada 511-line parity test suite + load test binary. Ada 4 isu yang perlu di-address sebelum go-live — tidak ada yang blocker kritis, tapi satu diantaranya (TTL hardcoded) berpotensi silent bug.
+
+| Aspek | Nilai |
+|---|---|
+| Arsitektur | A |
+| Keamanan | A |
+| Kesiapan Production | B+ |
+| Issues Ditemukan | 4 |
+
+---
+
+## 01 · Yang Sudah Sangat Baik
+
+### ✅ Deadlock fix yang tidak ada di Node.js
+`engine-core/src/hold.rs`
+
+Di `run_hold_txn()`, query SELECT FOR UPDATE menggunakan `ORDER BY leg_index`:
+
+```sql
+-- Rust engine (BENAR)
+SELECT booked, hold_ref FROM seat_inventory
+ WHERE trip_id = $1 AND seat_no = $2 AND leg_index = ANY($3)
+ ORDER BY leg_index     -- deterministic lock order
+ FOR UPDATE
+```
+
+```sql
+-- Node.js atomicHold.service.ts (TIDAK ADA ORDER BY)
+-- .select().from(seatInventory).where(...).for('update')
+-- tanpa ORDER, lock order non-deterministic → bisa deadlock
+```
+
+Tanpa `ORDER BY`, dua concurrent requests yang megang leg `[0,1]` dan `[1,0]` bisa deadlock. Engine Rust menyelesaikan ini dengan mengurutkan lock acquisition — ini canonical fix untuk PostgreSQL row-level deadlock dan **Node.js-nya belum punya ini**.
+
+---
+
+### ✅ HMAC signing dengan constant-time comparison
+`engine-server/src/middleware/hmac.rs`
+
+Service-to-service auth menggunakan `subtle::ConstantTimeEq` — mencegah timing attack. Signing string format `"{ts}.{METHOD}.{path}.{body_sha256}"` juga tepat — body hash di-sign, bukan body mentah (cegah size-based oracle attack). Timestamp skew check `|now - timestamp| > 30s` mencegah replay attack, dan `HMAC_SKEW_SECS` env-configurable. **Security implementation ini A-grade.**
+
+---
+
+### ✅ Advisory lock lebih bersih dari Node.js
+`engine-core/src/reaper.rs`
+
+Reaper menggunakan `pg_try_advisory_lock(hashtext('reservation_reaper'))` — string-based, bukan hardcoded integer seperti Node.js (`LOCK_HOLDS_CLEANUP = 8240_001`). Lebih readable dan tidak perlu manage angka magic yang bisa collision antar service.
+
+Engine juga meng-acquire lock pada koneksi yang sama untuk seluruh siklus acquire/work/release, yang merupakan requirement session-level advisory lock. Node.js scheduler sudah menangani ini dengan `pool.connect()` pinning, tapi Rust engine melakukannya lebih naturally via `pool.acquire()`.
+
+---
+
+### ✅ Redis publisher best-effort — DB adalah source of truth
+`engine-core/src/events.rs`
+
+Redis publish failure hanya di-`warn!`, tidak pernah gagalkan operasi. Jika Redis down, hold/confirm tetap berhasil di DB, hanya event realtime yang terlambat. `NoopPublisher` untuk testing/standalone juga clean — tidak ada mock yang bocor ke production code.
+
+---
+
+### ✅ Startup schema fail-fast probe
+`engine-server/src/main.rs`
+
+Engine langsung probe `seat_holds` dan `seat_inventory` dengan `SELECT ... LIMIT 0` sebelum server start. Jika `DATABASE_URL` salah menunjuk DB yang belum di-migrate, engine exit dengan pesan yang jelas — bukan crash pertama kali ada request. Sangat penting untuk arsitektur per-operator (nusa-shuttle, bus-kita).
+
+---
+
+### ✅ 511-line parity test suite + load test binary
+`engine-core/tests/parity.rs · loadtest/`
+
+Test suite menggunakan `RecordingPublisher` untuk assert urutan event (`inventory.updated` harus sebelum `holds.released`) — ini test yang sophisticated, bukan sekedar "apakah berhasil". Coverage meliputi: hold success/conflict/incomplete-inventory, release, confirm expired, reaper skip consumed holds, cancel, snapshot, concurrent stress.
+
+Load test binary dengan HDR histogram, HMAC signing otomatis, configurable concurrency (default 32), dan dua scenario (`hold-release` / `hold-confirm`).
+
+---
+
+## 02 · Issues yang Perlu Di-address
+
+### 🔴 Issue #1 — TTL class hardcoded, tidak baca env var
+`engine-core/src/types.rs`
+
+```rust
+// SEKARANG — hardcoded
+pub const fn seconds(self) -> i64 {
+    match self {
+        TtlClass::Short => 300,   // tidak baca env
+        TtlClass::Long  => 1800,  // tidak baca env
+    }
+}
+```
+
+Sementara **TransityTerminal Node.js membaca env vars**: `HOLD_TTL_SHORT_SECONDS` dan `HOLD_TTL_LONG_SECONDS`. Kalau operator mengubah TTL di `.env` Terminal, engine Rust tetap pakai 300/1800 detik — **silent mismatch**.
+
+**Fix:** Pass config ke engine, resolve TTL di `Config` level:
+
+```diff
+// engine-server/src/config.rs
++  pub ttl_short_secs: i64,
++  pub ttl_long_secs: i64,
+
+// from_env():
++  ttl_short_secs: env::var("HOLD_TTL_SHORT_SECONDS")
++      .ok().and_then(|s| s.parse().ok()).unwrap_or(300),
++  ttl_long_secs: env::var("HOLD_TTL_LONG_SECONDS")
++      .ok().and_then(|s| s.parse().ok()).unwrap_or(1800),
+
+// routes.rs — post_hold() resolve ttl sebelum call atomic_hold:
++  let ttl_secs = match req.ttl_class {
++      TtlClass::Short => state.cfg.ttl_short_secs,
++      TtlClass::Long  => state.cfg.ttl_long_secs,
++  };
+```
+
+---
+
+### 🟡 Issue #2 — Confirmed holds terakumulasi selamanya di seat_holds
+`engine-core/src/confirm.rs · engine-core/src/reaper.rs`
+
+Setelah confirm, `seat_holds` row mendapat `booking_id` diset tapi **tidak pernah dihapus**. Reaper secara eksplisit skip row dengan `booking_id IS NOT NULL`. Ini berbeda dari Node.js yang DELETE hold saat confirm.
+
+Desainnya membuat audit trail (bisa trace `hold_ref → booking_id`) — yang berguna. Tapi tanpa cleanup, `seat_holds` akan tumbuh selamanya.
+
+**Fix:** Tambahkan job cleanup untuk confirmed holds yang sudah tua:
+
+```sql
+-- Tambahkan ke reaper atau periodic job terpisah (interval lebih panjang)
+DELETE FROM seat_holds
+ WHERE booking_id IS NOT NULL
+   AND expires_at < now() - INTERVAL '30 days';
+```
+
+---
+
+### 🟡 Issue #3 — Idempotency store restart-volatile (in-memory only)
+`engine-server/src/middleware/idempotency.rs`
+
+Cache Moka tidak persist. Jika engine Rust restart dalam 24 jam sejak hold request, `Idempotency-Key` yang sama bisa menghasilkan hold kedua. Untuk sidecar dengan uptime tinggi ini umumnya tidak masalah, tapi perlu didokumentasikan.
+
+Jika Redis sudah ada, idempotency bisa disimpan di Redis dengan TTL 24h via `SET NX`. Tapi ini peningkatan opsional, bukan blocker. **Minimal: tambahkan komentar di code bahwa store ini volatile.**
+
+---
+
+### 🔵 Issue #4 — Node.js adapter belum diwiring
+`server/modules/holds/holds.service.ts · server/modules/bookings/bookings.service.ts`
+
+File `server/` di repo engine masih berisi Node.js yang langsung hit DB, bukan engine. `TT_HOLDS_ADAPTER_INSTRUCTIONS.md` adalah instruksi yang belum dieksekusi. Engine sudah benar, tapi saat ini belum ada traffic yang masuk dari Terminal.
+
+Langkah selanjutnya: ikuti instruksi adapter, buat `engineClient.ts` + `holdsAdapter.ts` di **TransityTerminal repo**:
+
+| Operasi Terminal | Node sekarang | Setelah adapter |
+|---|---|---|
+| `createHold()` | `atomicHoldService.atomicHold()` | `POST /api/v1/holds` |
+| `releaseHold()` | `atomicHoldService.releaseHoldByRef()` | `DELETE /api/v1/holds/:ref` |
+| `confirmSeatsBooked()` | `booking.helpers.confirmSeatsBooked()` | `POST /api/v1/holds/:ref/confirm` |
+| `cancelPassengerSeat()` | inline SQL di routes | `POST /api/v1/cancel-seats` |
+| `cleanupExpiredHolds()` | scheduler.ts reaper loop | engine reaper (hapus dari scheduler) |
+
+---
+
+### 🔵 Minor — OpenAPI spec hanya dokumen /healthz
+`lib/api-spec/openapi.yaml`
+
+Spec hanya berisi `/healthz`. Lima endpoint utama tidak terdokumentasi. Perlu dilengkapi kalau ada plan generate client dari spec (`lib/api-client-react/` sudah ada tapi kemungkinan outdated).
+
+---
+
+## 03 · Perbandingan Engine vs Node.js
+
+| Aspek | Node.js (Terminal) | Rust Engine |
+|---|---|---|
+| Hold deadlock prevention | ✗ Tidak ada `ORDER BY` | ✅ `ORDER BY leg_index` |
+| Advisory lock management | ~ Hardcoded int, manual pin | ✅ `hashtext()` string, `pool.acquire()` |
+| Service-to-service auth | ✗ Tidak ada | ✅ HMAC-SHA256 + timestamp skew |
+| Idempotency (write endpoints) | ~ Hanya di createBooking level | ✅ Middleware layer semua write endpoints |
+| Startup schema validation | ✗ Tidak ada | ✅ Fail-fast probe saat boot |
+| TTL configurable via env | ✅ `HOLD_TTL_SHORT/LONG_SECONDS` | ✗ Hardcoded 300/1800 — **PERLU DIFIX** |
+| Event ordering guarantee | ✅ inventory.updated → holds.released | ✅ `emit_release_pair()` menjamin urutan |
+| Reaper SKIP LOCKED | ✗ Tidak ada | ✅ `FOR UPDATE SKIP LOCKED` |
+| Confirmed hold lifecycle | ~ DELETE saat confirm | ~ UPDATE booking_id (audit trail, tapi akumulasi) |
+| Parity test coverage | ✗ Tidak ada | ✅ 511-line, termasuk event ordering |
+| Load test tooling | ✗ Tidak ada | ✅ Binary dengan HDR histogram |
+
+---
+
+## 04 · Urutan Aksi Prioritas
+
+1. **🔴 Fix TTL hardcoded** — Pass `HOLD_TTL_SHORT_SECONDS` / `HOLD_TTL_LONG_SECONDS` ke `Config`, resolve di routes sebelum call `atomic_hold()`.
+2. **🔴 Wire adapter di TransityTerminal** — Buat `engineClient.ts` + `holdsAdapter.ts` per instruksi di `TT_HOLDS_ADAPTER_INSTRUCTIONS.md`. Deploy ke satu operator dulu sebagai canary.
+3. **🟡 Cleanup confirmed holds lama** — Tambahkan DELETE job dengan interval harian/mingguan sebelum data bertambah banyak.
+4. **🔵 Lengkapi OpenAPI spec** — Document 5 endpoint utama, generate ulang client library.
+
+---
+
+*Review berdasarkan: TransityTerminal_ResvCoreEngine (latest commit, April 2026) × TransityTerminal (latest commit, April 2026)*
+*Rust stack: Axum 0.7 · sqlx 0.8 · Tokio 1.40 · deadpool-redis 0.18 · Moka 0.12*
