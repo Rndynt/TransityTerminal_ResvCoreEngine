@@ -12,7 +12,7 @@ use crate::middleware::{hmac, idempotency};
 use crate::state::AppState;
 use engine_core::{
     atomic_hold, cancel_booking_seats, confirm_booking, get_inventory_snapshot,
-    release_hold_by_ref, AtomicHoldResult, SeatHoldRequest, TtlClass,
+    release_hold_by_ref, AtomicHoldResult, HoldFailureReason, SeatHoldRequest, TtlClass,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -50,10 +50,13 @@ async fn post_hold(
         TtlClass::Long => state.ttl_long_secs,
     };
     let result = atomic_hold(&state.pool, &*state.publisher, req, ttl_seconds).await?;
-    let status = if result.is_success() {
-        StatusCode::CREATED
-    } else {
-        StatusCode::CONFLICT
+    let status = match &result {
+        AtomicHoldResult::Success { .. } => StatusCode::CREATED,
+        AtomicHoldResult::Failure { reason, .. } => match reason {
+            HoldFailureReason::IncompleteInventory => StatusCode::UNPROCESSABLE_ENTITY,
+            HoldFailureReason::SeatConflict => StatusCode::CONFLICT,
+            HoldFailureReason::TransactionError => StatusCode::INTERNAL_SERVER_ERROR,
+        },
     };
     Ok((status, Json(result)))
 }
@@ -75,12 +78,33 @@ async fn post_confirm(
     State(state): State<AppState>,
     Path(hold_ref): Path<String>,
     Json(body): Json<ConfirmBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let r = confirm_booking(&state.pool, &*state.publisher, &hold_ref, &body.booking_id).await?;
-    Ok(Json(json!({
-        "success": r.success,
-        "conflict": r.conflict,
-    })))
+    if r.success {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "hold_ref": hold_ref,
+                "booking_id": body.booking_id,
+            })),
+        ));
+    }
+    // Failure: surface via HTTP 409 so idempotency/auth/client layers can
+    // distinguish "confirm did not happen" from "confirm succeeded".
+    // Body retains the `success: false` + `conflict: <reason>` shape that
+    // older Terminal clients parse, and adds `reason` at top-level for
+    // clients that expect contract §8 error envelope.
+    let reason = r.conflict.as_deref().unwrap_or("HOLD_EXPIRED_OR_MISSING");
+    Ok((
+        StatusCode::CONFLICT,
+        Json(json!({
+            "success": false,
+            "reason": reason,
+            "conflict": reason,
+            "conflict_seats": [],
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
