@@ -18,7 +18,7 @@ pub use confirm::confirm_booking;
 pub use error::EngineError;
 pub use events::{EventPublisher, NoopPublisher, RedisPublisher, ReservationEvent};
 pub use hold::atomic_hold;
-pub use reaper::expire_holds;
+pub use reaper::{expire_holds, DEFAULT_CONFIRMED_HOLDS_RETENTION_DAYS};
 pub use release::release_hold_by_ref;
 pub use snapshot::get_inventory_snapshot;
 pub use types::*;

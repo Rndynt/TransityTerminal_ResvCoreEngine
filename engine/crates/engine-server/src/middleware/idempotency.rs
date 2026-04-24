@@ -3,6 +3,16 @@
 //! Same key + identical body → cached response replayed.
 //! Same key + different body → 409 Conflict.
 //! Entries TTL = 24h, capacity bounded.
+//!
+//! ## Volatility note
+//!
+//! The store is **in-process Moka cache** — it does NOT survive engine
+//! restart. If the engine crashes / is redeployed within the 24h replay
+//! window, an `Idempotency-Key` previously seen will look fresh and the
+//! request will be re-executed (e.g. a re-tried hold could create a
+//! second hold). For sidecar deployments with long uptime this is
+//! acceptable; for stricter guarantees swap this for a Redis-backed
+//! store using `SET NX` with TTL=24h.
 
 use std::time::Duration;
 

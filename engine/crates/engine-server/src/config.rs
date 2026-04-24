@@ -12,6 +12,15 @@ pub struct Config {
     pub db_min_conn: u32,
     pub db_max_conn: u32,
     pub idempotency_max: u64,
+    /// Hold TTL for the `short` class (seat-map pick). Mirrors
+    /// `HOLD_TTL_SHORT_SECONDS` in the Node Terminal so both sides agree.
+    pub ttl_short_secs: i64,
+    /// Hold TTL for the `long` class (pending booking). Mirrors
+    /// `HOLD_TTL_LONG_SECONDS` in the Node Terminal so both sides agree.
+    pub ttl_long_secs: i64,
+    /// Retention period before confirmed (booking_id IS NOT NULL) hold rows
+    /// are purged by the reaper. Acts as an audit-trail TTL.
+    pub confirmed_holds_retention_days: i64,
 }
 
 impl Config {
@@ -62,6 +71,18 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10_000),
+            ttl_short_secs: env::var("HOLD_TTL_SHORT_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
+            ttl_long_secs: env::var("HOLD_TTL_LONG_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1800),
+            confirmed_holds_retention_days: env::var("CONFIRMED_HOLDS_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
         })
     }
 }

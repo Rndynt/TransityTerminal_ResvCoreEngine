@@ -14,10 +14,18 @@ use crate::error::EngineError;
 use crate::events::{EventPublisher, ReservationEvent};
 use crate::types::{AtomicHoldResult, HoldFailureReason, SeatHoldRequest};
 
+/// Acquire an atomic seat hold.
+///
+/// `ttl_seconds` is the lifetime of the hold in seconds and **must** be
+/// resolved by the caller from operator configuration (env vars
+/// `HOLD_TTL_SHORT_SECONDS` / `HOLD_TTL_LONG_SECONDS` in production) so
+/// that engine and Node Terminal agree on the same expiry. The class on
+/// `req` is still used for the audit column and event payloads.
 pub async fn atomic_hold<P: EventPublisher + ?Sized>(
     pool: &sqlx::PgPool,
     publisher: &P,
     req: SeatHoldRequest,
+    ttl_seconds: i64,
 ) -> Result<AtomicHoldResult, EngineError> {
     let SeatHoldRequest {
         trip_id,
@@ -29,7 +37,7 @@ pub async fn atomic_hold<P: EventPublisher + ?Sized>(
 
     let hold_ref = Uuid::new_v4();
     let hold_ref_str = hold_ref.to_string(); // lowercase canonical (per contract §9.2)
-    let expires_at = Utc::now() + Duration::seconds(ttl_class.seconds());
+    let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
 
     let result = run_hold_txn(
         pool,

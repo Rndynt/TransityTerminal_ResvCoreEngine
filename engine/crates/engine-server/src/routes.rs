@@ -12,7 +12,7 @@ use crate::middleware::{hmac, idempotency};
 use crate::state::AppState;
 use engine_core::{
     atomic_hold, cancel_booking_seats, confirm_booking, get_inventory_snapshot,
-    release_hold_by_ref, AtomicHoldResult, SeatHoldRequest,
+    release_hold_by_ref, AtomicHoldResult, SeatHoldRequest, TtlClass,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -44,7 +44,12 @@ async fn post_hold(
     if req.seat_no.trim().is_empty() {
         return Err(ApiError::bad_request("seat_no required"));
     }
-    let result = atomic_hold(&state.pool, &*state.publisher, req).await?;
+    // Resolve TTL from operator config so engine + Terminal agree on expiry.
+    let ttl_seconds = match req.ttl_class {
+        TtlClass::Short => state.ttl_short_secs,
+        TtlClass::Long => state.ttl_long_secs,
+    };
+    let result = atomic_hold(&state.pool, &*state.publisher, req, ttl_seconds).await?;
     let status = if result.is_success() {
         StatusCode::CREATED
     } else {

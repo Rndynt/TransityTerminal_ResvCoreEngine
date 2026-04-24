@@ -2,7 +2,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// TTL class for a hold. `Short` = 300s (seat-map pick), `Long` = 1800s (pending booking).
+/// TTL class for a hold. `Short` = seat-map pick, `Long` = pending booking.
+///
+/// The actual TTL in seconds is supplied by the caller (resolved from
+/// `HOLD_TTL_SHORT_SECONDS` / `HOLD_TTL_LONG_SECONDS` env vars at the
+/// server layer so engine + Terminal stay in sync). The constants below
+/// are *defaults* used when no config is plumbed through (tests, loadtest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TtlClass {
@@ -11,7 +16,10 @@ pub enum TtlClass {
 }
 
 impl TtlClass {
-    pub const fn seconds(self) -> i64 {
+    /// Default TTL in seconds. Production callers should pass the value
+    /// resolved from operator config to `atomic_hold` instead of relying
+    /// on this constant.
+    pub const fn default_seconds(self) -> i64 {
         match self {
             TtlClass::Short => 300,
             TtlClass::Long => 1800,

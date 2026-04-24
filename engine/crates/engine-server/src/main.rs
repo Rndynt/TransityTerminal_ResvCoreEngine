@@ -105,11 +105,24 @@ async fn main() -> anyhow::Result<()> {
         hmac_secret: cfg.hmac_secret.clone(),
         hmac_skew_secs: cfg.hmac_skew_secs,
         idempotency,
+        ttl_short_secs: cfg.ttl_short_secs,
+        ttl_long_secs: cfg.ttl_long_secs,
     };
+
+    info!(
+        ttl_short = cfg.ttl_short_secs,
+        ttl_long = cfg.ttl_long_secs,
+        retention_days = cfg.confirmed_holds_retention_days,
+        "hold ttl + retention configuration loaded"
+    );
 
     // Spawn background reaper.
     let reaper_state = state.clone();
-    tokio::spawn(reaper_task::run(reaper_state, cfg.reaper_interval_secs));
+    tokio::spawn(reaper_task::run(
+        reaper_state,
+        cfg.reaper_interval_secs,
+        cfg.confirmed_holds_retention_days,
+    ));
 
     let app: Router = routes::router(state);
 

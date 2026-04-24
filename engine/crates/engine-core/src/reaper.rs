@@ -5,6 +5,7 @@
 //! deployments single-runner. Holds with `booking_id IS NOT NULL` are NEVER
 //! released.
 
+use chrono::{Duration, Utc};
 use sqlx::{Acquire, Row};
 use uuid::Uuid;
 
@@ -14,10 +15,15 @@ use crate::types::ReaperResult;
 
 const REAPER_LOCK_KEY: &str = "reservation_reaper";
 const BATCH_LIMIT: i64 = 500;
+/// Default retention for confirmed (booking_id IS NOT NULL) hold rows when
+/// the caller doesn't supply an explicit value (tests, loadtest). Production
+/// callers should pass `CONFIRMED_HOLDS_RETENTION_DAYS` from operator env.
+pub const DEFAULT_CONFIRMED_HOLDS_RETENTION_DAYS: i64 = 30;
 
 pub async fn expire_holds<P: EventPublisher + ?Sized>(
     pool: &sqlx::PgPool,
     publisher: &P,
+    confirmed_retention_days: i64,
 ) -> Result<ReaperResult, EngineError> {
     let mut conn = pool.acquire().await?;
 
@@ -31,7 +37,7 @@ pub async fn expire_holds<P: EventPublisher + ?Sized>(
         return Ok(ReaperResult { released_count: 0 });
     }
 
-    let result = run_reaper(&mut conn).await;
+    let result = run_reaper(&mut conn, confirmed_retention_days).await;
 
     // Always release the advisory lock.
     let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1))")
@@ -55,7 +61,33 @@ pub async fn expire_holds<P: EventPublisher + ?Sized>(
 
 async fn run_reaper(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    confirmed_retention_days: i64,
 ) -> Result<Vec<(Uuid, String, Vec<i32>)>, sqlx::Error> {
+    // Audit-trail purge: confirmed holds (booking_id IS NOT NULL) are kept
+    // for `confirmed_retention_days` after expiry then deleted so the table
+    // doesn't grow forever. Done in its own statement (not the main
+    // transaction) so a slow purge can't hold the reaper transaction open.
+    if confirmed_retention_days > 0 {
+        let cutoff = Utc::now() - Duration::days(confirmed_retention_days);
+        let purged = sqlx::query(
+            r#"
+            DELETE FROM seat_holds
+             WHERE booking_id IS NOT NULL
+               AND expires_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&mut **conn)
+        .await?;
+        if purged.rows_affected() > 0 {
+            tracing::info!(
+                purged = purged.rows_affected(),
+                retention_days = confirmed_retention_days,
+                "purged old confirmed hold rows"
+            );
+        }
+    }
+
     let mut tx = conn.begin().await?;
 
     let expired_rows = sqlx::query(

@@ -9,10 +9,36 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engine_core::{
-    atomic_hold, cancel_booking_seats, confirm_booking, expire_holds, get_inventory_snapshot,
-    release_hold_by_ref, AtomicHoldResult, EventPublisher, HoldFailureReason, NoopPublisher,
-    ReservationEvent, SeatHoldRequest, SeatStatusKind, TtlClass,
+    cancel_booking_seats, confirm_booking, get_inventory_snapshot, release_hold_by_ref,
+    AtomicHoldResult, EventPublisher, HoldFailureReason, NoopPublisher, ReservationEvent,
+    SeatHoldRequest, SeatStatusKind, TtlClass,
 };
+
+/// Test wrapper: resolves TTL seconds from the request's class via
+/// `TtlClass::default_seconds()` so the parity suite (authored before
+/// TTL became env-driven) keeps its old contract.
+async fn atomic_hold<P: EventPublisher + ?Sized>(
+    pool: &PgPool,
+    publisher: &P,
+    req: SeatHoldRequest,
+) -> Result<AtomicHoldResult, engine_core::EngineError> {
+    let ttl = req.ttl_class.default_seconds();
+    engine_core::atomic_hold(pool, publisher, req, ttl).await
+}
+
+/// Test wrapper: invokes the reaper with the production default
+/// 30-day confirmed-holds retention.
+async fn expire_holds<P: EventPublisher + ?Sized>(
+    pool: &PgPool,
+    publisher: &P,
+) -> Result<engine_core::ReaperResult, engine_core::EngineError> {
+    engine_core::expire_holds(
+        pool,
+        publisher,
+        engine_core::DEFAULT_CONFIRMED_HOLDS_RETENTION_DAYS,
+    )
+    .await
+}
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Mutex;

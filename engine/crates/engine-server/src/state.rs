@@ -9,4 +9,6 @@ pub struct AppState {
     pub hmac_secret: String,
     pub hmac_skew_secs: i64,
     pub idempotency: Arc<IdempotencyStore>,
+    pub ttl_short_secs: i64,
+    pub ttl_long_secs: i64,
 }
