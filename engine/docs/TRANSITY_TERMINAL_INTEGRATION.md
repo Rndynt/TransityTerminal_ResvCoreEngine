@@ -279,10 +279,10 @@ try {
 ```
 
 **Engine behavior** (contract §3.1):
-- HTTP 201 on success with `{ hold_ref, expires_at }`
-- HTTP 409 on `SEAT_CONFLICT` with `{ reason, conflict_seats: [seat_no] }`
-- HTTP 422 on `INCOMPLETE_INVENTORY` with `{ reason, conflict_seats: [seat_no] }`
-- TTL: `short` = 300 s, `long` = 1800 s — **fixed by contract**
+- HTTP 201 on success with `{ success: true, hold_ref, expires_at }`
+- HTTP 409 on `SEAT_CONFLICT` with `{ success: false, reason: "SEAT_CONFLICT", conflict_seats: [seat_no] }`
+- HTTP 422 on `INCOMPLETE_INVENTORY` with `{ success: false, reason: "INCOMPLETE_INVENTORY", conflict_seats: [seat_no] }`
+- TTL: resolved from operator's `HOLD_TTL_SHORT_SECONDS` / `HOLD_TTL_LONG_SECONDS` env (engine + Terminal share the same config). Defaults: `short` = 300 s, `long` = 1800 s.
 
 ### 5.2 Release a hold
 
@@ -336,6 +336,13 @@ try {
 > **Recommended pattern instead**: introduce a `pending` booking status that becomes `paid` only after all confirms succeed. This is what TransityTerminal already does for `createPendingBooking()` — extend the same pattern to all bookings to avoid compensating writes.
 
 The engine's `confirm` is idempotent per `Idempotency-Key` for 24 hours.
+
+**Engine behavior** (contract §3.3):
+- HTTP 200 on success with `{ success: true, hold_ref, booking_id }`
+- HTTP 409 on failure with `{ success: false, reason: "HOLD_EXPIRED_OR_MISSING" | "HOLD_ALREADY_CONSUMED", conflict: "<same reason>", conflict_seats: [] }`
+  — the `reason` field is authoritative; `conflict` is kept for backwards compatibility with pre-1.1 clients.
+
+> **Breaking change from engine v1.0**: confirm previously returned HTTP 200 on failure with `{ success: false, conflict }`, which forced callers to inspect the body. As of v1.1 a failed confirm returns HTTP 409 so clients throw naturally on `!res.ok`. Old clients that returned the 200 body without checking `success` silently proceeded with a non-confirmed booking — see `TransityTerminal-code-review.md §10.1`.
 
 ### 5.4 Cancel passenger seats — replaces inline seat release in `bookings.routes.ts:115`
 

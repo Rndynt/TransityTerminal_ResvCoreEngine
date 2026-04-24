@@ -110,7 +110,14 @@ pub async fn layer(
         .await
         .map_err(|_| ApiError::internal("response body too large to cache").into_response())?;
 
-    if parts.status.is_success() || parts.status == StatusCode::CONFLICT {
+    // Cache any deterministic response: 2xx success, 409 Conflict (seat
+    // conflict / hold expired), and 422 Unprocessable Entity (incomplete
+    // inventory). Non-deterministic failures (5xx, 401/403 auth, 400 body
+    // parse) are not cached because a retry might legitimately succeed.
+    if parts.status.is_success()
+        || parts.status == StatusCode::CONFLICT
+        || parts.status == StatusCode::UNPROCESSABLE_ENTITY
+    {
         state
             .idempotency
             .put(
