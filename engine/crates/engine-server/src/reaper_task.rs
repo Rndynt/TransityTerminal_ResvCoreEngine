@@ -31,3 +31,20 @@ pub async fn run(state: AppState, interval_secs: u64, confirmed_retention_days: 
         }
     }
 }
+
+/// P1 §10.3: physically delete idempotency cache rows whose `expires_at`
+/// has passed. Reads already filter expired rows, so this loop is purely
+/// a space-reclamation sweep — failure here is non-fatal.
+pub async fn run_idempotency_sweep(state: AppState, interval_secs: u64) {
+    let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    info!(interval_secs, "idempotency cache sweep task started");
+    loop {
+        tick.tick().await;
+        match state.idempotency.sweep_expired().await {
+            Ok(0) => {}
+            Ok(n) => info!(removed = n, "idempotency cache rows expired"),
+            Err(e) => error!(error = %e, "idempotency sweep failed"),
+        }
+    }
+}

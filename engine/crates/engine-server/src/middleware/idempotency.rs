@@ -2,17 +2,18 @@
 //!
 //! Same key + identical body → cached response replayed.
 //! Same key + different body → 409 Conflict.
-//! Entries TTL = 24h, capacity bounded.
+//! Entries TTL = 24h.
 //!
-//! ## Volatility note
+//! ## Durable backend (P1 §10.3)
 //!
-//! The store is **in-process Moka cache** — it does NOT survive engine
-//! restart. If the engine crashes / is redeployed within the 24h replay
-//! window, an `Idempotency-Key` previously seen will look fresh and the
-//! request will be re-executed (e.g. a re-tried hold could create a
-//! second hold). For sidecar deployments with long uptime this is
-//! acceptable; for stricter guarantees swap this for a Redis-backed
-//! store using `SET NX` with TTL=24h.
+//! The store is **Postgres-backed** so cached responses survive engine
+//! restart (rolling deploy, crash, OOM kill, sleep). Each cache hit is a
+//! single indexed PK lookup and each miss is one INSERT … ON CONFLICT DO
+//! NOTHING — well within the latency budget for write endpoints. Expired
+//! entries are filtered at read time; the engine's reaper task sweeps
+//! them periodically (`reaper_task::run` calls `sweep_expired`).
+//!
+//! Migration: `engine/migrations/0002_idempotency_cache.sql`.
 
 use std::time::Duration;
 
@@ -21,13 +22,17 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use moka::future::Cache;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
 const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
+
+/// Default TTL for cached responses (contract §6).
+pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
@@ -38,25 +43,82 @@ pub struct CachedResponse {
 
 #[derive(Clone)]
 pub struct IdempotencyStore {
-    cache: Cache<String, CachedResponse>,
+    pool: sqlx::PgPool,
+    ttl: Duration,
 }
 
 impl IdempotencyStore {
-    pub fn new(max_capacity: u64) -> Self {
+    pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
-            cache: Cache::builder()
-                .max_capacity(max_capacity)
-                .time_to_live(Duration::from_secs(24 * 3600))
-                .build(),
+            pool,
+            ttl: IDEMPOTENCY_TTL,
         }
     }
 
-    pub async fn get(&self, key: &str) -> Option<CachedResponse> {
-        self.cache.get(key).await
+    /// Read a cached response. Returns `None` for missing AND expired entries
+    /// (the `expires_at > now()` filter rejects stale rows even if the
+    /// reaper hasn't swept them yet).
+    pub async fn get(&self, key: &str) -> Result<Option<CachedResponse>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT body_hash, status_code, response_body
+              FROM engine_idempotency_cache
+             WHERE key = $1
+               AND expires_at > now()
+            "#,
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let body_hash: String = row.try_get("body_hash")?;
+        let status_code: i32 = row.try_get("status_code")?;
+        let body: Vec<u8> = row.try_get("response_body")?;
+
+        Ok(Some(CachedResponse {
+            status: status_code as u16,
+            body,
+            body_hash,
+        }))
     }
 
-    pub async fn put(&self, key: String, value: CachedResponse) {
-        self.cache.insert(key, value).await;
+    /// Insert-or-no-op a cached response. Returns `Ok(true)` if this writer
+    /// won the race (the row was inserted), `Ok(false)` if another writer
+    /// already populated the same key concurrently. The middleware does not
+    /// branch on the result — both outcomes are correct.
+    pub async fn put(&self, key: &str, value: CachedResponse) -> Result<bool, sqlx::Error> {
+        let expires_at: DateTime<Utc> = Utc::now() + chrono::Duration::from_std(self.ttl).unwrap();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO engine_idempotency_cache
+                   (key, body_hash, status_code, response_body, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (key) DO NOTHING
+            "#,
+        )
+        .bind(key)
+        .bind(&value.body_hash)
+        .bind(value.status as i32)
+        .bind(&value.body)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Periodic cleanup — DELETE entries where `expires_at <= now()`.
+    /// Returns the number of rows removed. Safe to call concurrently with
+    /// reads; expired rows are already filtered by `get`.
+    pub async fn sweep_expired(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM engine_idempotency_cache WHERE expires_at <= now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -88,7 +150,13 @@ pub async fn layer(
         hex::encode(h.finalize())
     };
 
-    if let Some(cached) = state.idempotency.get(&key).await {
+    let cached = state
+        .idempotency
+        .get(&key)
+        .await
+        .map_err(|e| ApiError::internal(format!("idempotency lookup failed: {e}")).into_response())?;
+
+    if let Some(cached) = cached {
         if cached.body_hash != body_hash {
             return Err(ApiError::conflict("idempotency key reused with different body").into_response());
         }
@@ -118,17 +186,23 @@ pub async fn layer(
         || parts.status == StatusCode::CONFLICT
         || parts.status == StatusCode::UNPROCESSABLE_ENTITY
     {
-        state
+        // Best-effort write. If the DB write fails we still return the
+        // response to the caller — losing a cache write is preferable to
+        // failing the original request.
+        if let Err(e) = state
             .idempotency
             .put(
-                key,
+                &key,
                 CachedResponse {
                     status: parts.status.as_u16(),
                     body: resp_bytes.to_vec(),
                     body_hash,
                 },
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, key = %key, "idempotency cache write failed");
+        }
     }
 
     parts.headers.insert("x-idempotent-replayed", "false".parse().unwrap());

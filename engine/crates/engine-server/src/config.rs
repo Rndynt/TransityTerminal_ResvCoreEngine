@@ -11,7 +11,9 @@ pub struct Config {
     pub reaper_interval_secs: u64,
     pub db_min_conn: u32,
     pub db_max_conn: u32,
-    pub idempotency_max: u64,
+    /// How often the reaper purges expired idempotency cache rows.
+    /// Reuses `reaper_interval_secs` — see `reaper_task::run`.
+    pub idempotency_sweep_interval_secs: u64,
     /// Hold TTL for the `short` class (seat-map pick). Mirrors
     /// `HOLD_TTL_SHORT_SECONDS` in the Node Terminal so both sides agree.
     pub ttl_short_secs: i64,
@@ -67,10 +69,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
-            idempotency_max: env::var("IDEMPOTENCY_MAX")
+            idempotency_sweep_interval_secs: env::var("IDEMPOTENCY_SWEEP_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(10_000),
+                .unwrap_or(3600), // hourly is fine — reads filter expired rows anyway
             ttl_short_secs: env::var("HOLD_TTL_SHORT_SECONDS")
                 .ok()
                 .and_then(|s| s.parse().ok())

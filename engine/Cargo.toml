@@ -28,7 +28,6 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2.6"
-moka = { version = "0.12", features = ["future"] }
 anyhow = "1"
 dotenvy = "0.15"
 futures = "0.3"

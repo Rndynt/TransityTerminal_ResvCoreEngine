@@ -72,7 +72,7 @@ comparison via `subtle`.
 | `HMAC_SKEW_SECS`                   | no       | `30`             |                                          |
 | `REAPER_INTERVAL_SECS`             | no       | `60`             |                                          |
 | `DB_MIN_CONN`, `DB_MAX_CONN`       | no       | `10`, `50`       | Per contract §8                         |
-| `IDEMPOTENCY_MAX`                  | no       | `10000`          | LRU capacity                            |
+| `IDEMPOTENCY_SWEEP_INTERVAL_SECS`  | no       | `3600`           | Period between sweeps that purge expired idempotency rows. Reads filter `expires_at > now()` regardless. |
 
 ## Build & Run
 
