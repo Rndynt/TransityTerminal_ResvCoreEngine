@@ -521,6 +521,7 @@ Before merging the cutover PR:
 - **Database connections**: engine uses a pool of 10–50 (configurable). Add this to your Neon plan budget.
 - **Engine restarts**: safe at any time. In-flight HTTP requests will fail with connection-reset; caller should retry idempotently. The internal reaper resumes automatically.
 - **Idempotency**: every write endpoint accepts `Idempotency-Key`. Replays within 24 h with the same body return the cached response; same key + different body returns 409. Use UUIDv4 from TransityTerminal.
+  - The cache key the engine actually stores is `sha256(svc_id|method|path|raw_key)` (P2 §10.6) — the same raw `Idempotency-Key` value can safely be used across distinct endpoints or services without collision. Callers do not need to namespace keys themselves.
 - **Clock skew**: engine rejects requests with `|ts_now - X-Timestamp| > 30 s`. NTP your servers.
 - **Schema migration**: engine ships its own migrations (`engine/migrations/0001_init.sql`) and runs them on startup with `IF NOT EXISTS` guards. Safe to point at a DB that already has the tables — engine will skip.
 - **Multi-instance engine**: safe. Reaper uses `pg_try_advisory_lock(hashtext('reservation_reaper'))` so only one instance reaps at a time. HTTP traffic load-balances normally.

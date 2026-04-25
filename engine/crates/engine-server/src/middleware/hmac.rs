@@ -114,5 +114,4 @@ pub async fn verify(
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ServiceIdentity(pub String);

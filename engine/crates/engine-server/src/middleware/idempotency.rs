@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::error::ApiError;
+use crate::middleware::hmac::ServiceIdentity;
 use crate::state::AppState;
 
 const MAX_BODY_BYTES: usize = 1 * 1024 * 1024;
@@ -147,10 +148,26 @@ pub async fn layer(
         return Ok(next.run(request).await);
     }
 
-    let key = match get_idempotency_key(request.headers()) {
+    let raw_key = match get_idempotency_key(request.headers()) {
         Some(k) => k,
         None => return Ok(next.run(request).await),
     };
+
+    // P2 §10.6: namespace the cache key by `(svc_id, method, path,
+    // raw_key)` so two services or two endpoints can never collide on
+    // the same `Idempotency-Key`. svc_id comes from the HMAC layer (it
+    // populates `ServiceIdentity` in extensions before this middleware
+    // runs); fall back to "anonymous" only if the request somehow
+    // bypassed HMAC (e.g. /healthz — but that's GET-only and never
+    // reaches here).
+    let svc_id = request
+        .extensions()
+        .get::<ServiceIdentity>()
+        .map(|s| s.0.as_str())
+        .unwrap_or("anonymous");
+    let path = request.uri().path().to_string();
+    let method_str = m.as_str().to_string();
+    let key = scoped_idempotency_key(svc_id, &method_str, &path, &raw_key);
 
     // Buffer the body so we can hash it AND replay to the inner handler.
     let (parts, body) = request.into_parts();
@@ -229,4 +246,60 @@ fn get_idempotency_key(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Build the cache key actually written to Postgres.
+///
+/// Mixes `svc_id`, HTTP method, request path, and the caller's
+/// `Idempotency-Key` header into a single SHA-256 digest. This
+/// prevents two distinct endpoints (or two services on the same
+/// engine cluster) from colliding when callers happen to choose the
+/// same raw idempotency key.
+///
+/// Components are separated by `|` (forbidden in URL paths and not
+/// emitted by valid HTTP method tokens) and length-prefixed so a
+/// pathological caller can't construct two distinct tuples that
+/// hash to the same digest.
+fn scoped_idempotency_key(svc_id: &str, method: &str, path: &str, raw_key: &str) -> String {
+    let mut h = Sha256::new();
+    for part in [svc_id, method, path, raw_key] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part.as_bytes());
+        h.update(b"|");
+    }
+    hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scoped_idempotency_key;
+
+    #[test]
+    fn distinct_routes_produce_distinct_keys() {
+        let a = scoped_idempotency_key("terminal", "POST", "/api/v1/holds", "K1");
+        let b = scoped_idempotency_key("terminal", "POST", "/api/v1/holds/abc/confirm", "K1");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn distinct_services_produce_distinct_keys() {
+        let a = scoped_idempotency_key("terminal", "POST", "/api/v1/holds", "K1");
+        let b = scoped_idempotency_key("console", "POST", "/api/v1/holds", "K1");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn same_request_produces_same_key() {
+        let a = scoped_idempotency_key("terminal", "POST", "/api/v1/holds", "K1");
+        let b = scoped_idempotency_key("terminal", "POST", "/api/v1/holds", "K1");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn length_prefix_prevents_concat_collision() {
+        // Without length prefixing, ("ab", "c", ...) and ("a", "bc", ...) would collide.
+        let a = scoped_idempotency_key("ab", "c", "/p", "k");
+        let b = scoped_idempotency_key("a", "bc", "/p", "k");
+        assert_ne!(a, b);
+    }
 }
