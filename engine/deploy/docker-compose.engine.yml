@@ -50,7 +50,9 @@ services:
       - DB_MIN_CONN=${DB_MIN_CONN:-2}
       - DB_MAX_CONN=${DB_MAX_CONN:-10}
       # === Idempotency cache ==============================================
-      - IDEMPOTENCY_MAX=${IDEMPOTENCY_MAX:-10000}
+      # P1 §10.3: Postgres-backed, durable across restart. The setting below
+      # only controls how often expired rows are physically purged.
+      - IDEMPOTENCY_SWEEP_INTERVAL_SECS=${IDEMPOTENCY_SWEEP_INTERVAL_SECS:-3600}
       # === Optional Redis pub/sub for inventory.updated / holds.released ==
       # Leave unset to disable event publication.
       - REDIS_URL=${REDIS_URL:-}

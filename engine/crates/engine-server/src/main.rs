@@ -96,8 +96,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // P1 §10.3: Postgres-backed idempotency store survives restart. The
+    // store is unbounded — capacity is governed by the reaper sweep
+    // interval (rows expire after 24h and are physically removed by the
+    // periodic DELETE in `reaper_task::run`).
     let idempotency =
-        std::sync::Arc::new(middleware::idempotency::IdempotencyStore::new(cfg.idempotency_max));
+        std::sync::Arc::new(middleware::idempotency::IdempotencyStore::new(pg_pool.clone()));
 
     let state = AppState {
         pool: pg_pool.clone(),
@@ -122,6 +126,13 @@ async fn main() -> anyhow::Result<()> {
         reaper_state,
         cfg.reaper_interval_secs,
         cfg.confirmed_holds_retention_days,
+    ));
+
+    // Spawn idempotency cache sweep (P1 §10.3).
+    let idem_state = state.clone();
+    tokio::spawn(reaper_task::run_idempotency_sweep(
+        idem_state,
+        cfg.idempotency_sweep_interval_secs,
     ));
 
     let app: Router = routes::router(state);

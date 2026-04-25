@@ -84,7 +84,7 @@ Set these env vars on the engine process (already done in this Replit project):
 | `HMAC_SKEW_SECS` | no (default 30) | | Max clock skew tolerated |
 | `REAPER_INTERVAL_SECS` | no (default 60) | | |
 | `DB_MIN_CONN` / `DB_MAX_CONN` | no (10 / 50) | | Per contract §8 |
-| `IDEMPOTENCY_MAX` | no (10000) | | LRU cache size |
+| `IDEMPOTENCY_SWEEP_INTERVAL_SECS` | no (3600) | | How often expired idempotency rows are purged. Reads filter expired rows regardless. |
 
 The engine runs migrations on startup (`engine/migrations/0001_init.sql`). The schema is **identical** to TransityTerminal's `seat_inventory` / `seat_holds` tables — no schema changes needed if TransityTerminal already has them.
 
