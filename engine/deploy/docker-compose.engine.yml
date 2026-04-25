@@ -44,6 +44,10 @@ services:
       # MUST match the value TT signs with. Same env var name on both sides.
       - RESERVATION_ENGINE_HMAC_SECRET=${RESERVATION_ENGINE_HMAC_SECRET}
       - HMAC_SKEW_SECS=${HMAC_SKEW_SECS:-30}
+      # === X-Service-Id allowlist (P3 §10.13, optional) ===================
+      # Empty/unset = check disabled; set to e.g. "terminal,console" to
+      # reject calls with unknown svc_ids even when HMAC is valid.
+      - ALLOWED_SERVICE_IDS=${ALLOWED_SERVICE_IDS:-}
       # === Reaper =========================================================
       - REAPER_INTERVAL_SECS=${REAPER_INTERVAL_SECS:-60}
       # === Connection pool ================================================

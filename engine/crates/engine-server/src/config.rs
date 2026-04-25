@@ -8,6 +8,11 @@ pub struct Config {
     pub redis_url: Option<String>,
     pub hmac_secret: String,
     pub hmac_skew_secs: i64,
+    /// Allowlist of accepted `X-Service-Id` values. Empty `Vec` disables
+    /// the check (default — back-compat for single-tenant deploys where
+    /// any caller with a valid HMAC is authoritative). Configure via
+    /// `ALLOWED_SERVICE_IDS=terminal,console`.
+    pub allowed_service_ids: Vec<String>,
     pub reaper_interval_secs: u64,
     pub db_min_conn: u32,
     pub db_max_conn: u32,
@@ -57,6 +62,15 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
+            allowed_service_ids: env::var("ALLOWED_SERVICE_IDS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             reaper_interval_secs: env::var("REAPER_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())

@@ -94,6 +94,17 @@ pub async fn verify(
         return Err(ApiError::unauthorized("signature mismatch").into_response());
     }
 
+    // P3 §10.13: defense-in-depth allowlist. Runs *after* HMAC verify
+    // so unauthenticated callers can't enumerate valid svc_ids by
+    // diffing error messages — they'd hit "signature mismatch" first
+    // regardless of whether the svc_id is in the allowlist. Empty
+    // allowlist = check disabled (back-compat for single-tenant).
+    if !state.allowed_service_ids.is_empty()
+        && !state.allowed_service_ids.iter().any(|allowed| allowed == svc_id)
+    {
+        return Err(ApiError::unauthorized("X-Service-Id not in allowlist").into_response());
+    }
+
     tracing::debug!(svc_id, "hmac verified");
 
     let mut new_request = Request::from_parts(parts, Body::from(bytes));
@@ -104,5 +115,4 @@ pub async fn verify(
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ServiceIdentity(pub String);
