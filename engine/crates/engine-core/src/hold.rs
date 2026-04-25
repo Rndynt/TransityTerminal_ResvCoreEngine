@@ -83,18 +83,32 @@ async fn run_hold_txn(
 ) -> Result<Result<(), HoldFailureReason>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    // 1. Lock inventory rows (row-level, blocking).
-    //    ORDER BY leg_index gives deterministic lock acquisition order across
-    //    concurrent holds touching overlapping leg ranges, avoiding deadlocks.
+    // 1. Lock inventory rows (row-level, blocking) and pull the
+    //    referenced hold's expiry + booking_id in the same query.
+    //    ORDER BY leg_index gives deterministic lock acquisition order
+    //    across concurrent holds touching overlapping leg ranges,
+    //    avoiding deadlocks. `FOR UPDATE OF i` only locks the
+    //    seat_inventory rows (not seat_holds) — holds rows are read-
+    //    only here, the reaper / release path is the only writer.
+    //
+    // P2 §10.7 — without the LEFT JOIN, an expired hold whose
+    // `hold_ref` is still pinned on inventory (because the reaper
+    // hasn't swept yet, max 60s window) would surface as a false
+    // SEAT_CONFLICT and the user would see "kursi sudah di-hold"
+    // for a seat nobody is actually holding any more.
     let rows = sqlx::query(
         r#"
-        SELECT booked, hold_ref
-          FROM seat_inventory
-         WHERE trip_id = $1
-           AND seat_no = $2
-           AND leg_index = ANY($3)
-         ORDER BY leg_index
-         FOR UPDATE
+        SELECT i.booked,
+               i.hold_ref,
+               h.expires_at  AS hold_expires_at,
+               h.booking_id  AS hold_booking_id
+          FROM seat_inventory i
+          LEFT JOIN seat_holds h ON h.hold_ref = i.hold_ref
+         WHERE i.trip_id = $1
+           AND i.seat_no = $2
+           AND i.leg_index = ANY($3)
+         ORDER BY i.leg_index
+         FOR UPDATE OF i
         "#,
     )
     .bind(trip_id)
@@ -109,12 +123,42 @@ async fn run_hold_txn(
         return Ok(Err(HoldFailureReason::IncompleteInventory));
     }
 
-    // 2b. Conflict check.
+    // 2b. Conflict check (P2 §10.7 — expired-aware).
+    //
+    // A leg conflicts iff:
+    //   (a) it is already booked, OR
+    //   (b) it has a hold_ref pointing at an *active* seat_holds row,
+    //       i.e. one that has either not expired yet (h.expires_at >
+    //       now()) or has been confirmed (h.booking_id IS NOT NULL).
+    //
+    // An orphaned hold_ref (no matching seat_holds row, or one whose
+    // expires_at has lapsed without a booking_id) is treated as a
+    // tombstone the reaper will sweep — we proceed with the new hold
+    // and overwrite it.
+    let now = Utc::now();
     for r in &rows {
         let booked: bool = r.try_get("booked")?;
-        let existing_hold: Option<String> = r.try_get("hold_ref")?;
-        if booked || existing_hold.is_some() {
+        if booked {
             return Ok(Err(HoldFailureReason::SeatConflict));
+        }
+        let existing_hold: Option<String> = r.try_get("hold_ref")?;
+        if existing_hold.is_some() {
+            let hold_expires_at: Option<chrono::DateTime<Utc>> = r.try_get("hold_expires_at")?;
+            let hold_booking_id: Option<String> = r.try_get("hold_booking_id")?;
+            let active = match (hold_expires_at, hold_booking_id.as_deref()) {
+                // Confirmed hold (booking_id set) — always treat as
+                // active regardless of expiry; release path nulls
+                // hold_ref when the booking is cancelled.
+                (_, Some(_)) => true,
+                // Unconfirmed hold still inside its TTL window.
+                (Some(exp), None) => exp > now,
+                // hold_ref without a matching seat_holds row, or with
+                // expires_at NULL — treat as orphan, not a conflict.
+                (None, None) => false,
+            };
+            if active {
+                return Ok(Err(HoldFailureReason::SeatConflict));
+            }
         }
     }
 
