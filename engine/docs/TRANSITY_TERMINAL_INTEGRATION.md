@@ -186,7 +186,15 @@ async function call<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: a
     const json = text ? JSON.parse(text) : null;
 
     if (!res.ok) {
-      throw new EngineError(res.status, json?.code ?? 'UNKNOWN', json?.message ?? res.statusText, json);
+      // P2 §10.5 — engine error body shape is uniform:
+      //   { success: false, reason, message, details? }
+      // for both HMAC/auth errors and application failures.
+      throw new EngineError(
+        res.status,
+        json?.reason ?? 'UNKNOWN',
+        json?.message ?? res.statusText,
+        json,
+      );
     }
     return json as T;
   } finally {
@@ -484,16 +492,30 @@ Call `startEngineEventSubscriber()` in `server/index.ts` startup.
 
 ## 8. Error Code Mapping
 
-| Engine HTTP | Engine `code` | TransityTerminal user-visible mapping |
+All engine error responses use a single flat shape (P2 §10.5):
+
+```json
+{
+  "success": false,
+  "reason":  "<UPPER_SNAKE_CODE>",
+  "message": "human readable",
+  "details": { ... }    // optional, omitted when not applicable
+}
+```
+
+The `reason` field is authoritative — TT reads it directly and maps to user-facing text. `details` carries shape-specific extras (e.g. `conflict_seats: ["12A"]` for `SEAT_CONFLICT`).
+
+| Engine HTTP | `reason` | TransityTerminal user-visible mapping |
 |---|---|---|
 | 201 | — | success |
 | 204 | — | success (release) |
 | 400 | `BAD_REQUEST` | 400 — validation error |
-| 401 | `INVALID_SIGNATURE` / `STALE_TIMESTAMP` | 500 — internal (config bug) |
+| 401 | `UNAUTHORIZED` | 500 — internal (config bug; HMAC mismatch, missing/expired timestamp, unknown svc_id) |
 | 404 | `HOLD_NOT_FOUND` | for release: treat as no-op; for confirm: 410 GONE |
 | 409 | `SEAT_CONFLICT` | 409 — `Kursi sedang dipegang oleh agen lain` |
+| 409 | `HOLD_EXPIRED_OR_MISSING` | 409 — `Hold telah kadaluarsa, silakan hold ulang` |
 | 409 | `IDEMPOTENCY_BODY_MISMATCH` | 500 — internal (caller bug, key reused with different body) |
-| 410 | `HOLD_EXPIRED` | 410 — `Hold telah kadaluarsa, silakan hold ulang` |
+| 413 | `BODY_TOO_LARGE` | 500 — internal (request body > 1 MiB) |
 | 422 | `INCOMPLETE_INVENTORY` | 422 — `Inventori belum diinisialisasi, jalankan precompute` |
 | 5xx | `INTERNAL` | 500 — generic |
 
