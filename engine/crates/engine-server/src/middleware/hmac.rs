@@ -42,16 +42,6 @@ pub async fn verify(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::unauthorized("missing X-Service-Id").into_response())?;
 
-    // P3 §10.13: defense-in-depth allowlist. If a partial secret leak
-    // ever occurs, an attacker can't trivially impersonate another
-    // service without also knowing a valid svc_id from the configured
-    // operator list. Empty allowlist = check disabled (back-compat).
-    if !state.allowed_service_ids.is_empty()
-        && !state.allowed_service_ids.iter().any(|allowed| allowed == svc_id)
-    {
-        return Err(ApiError::unauthorized("X-Service-Id not in allowlist").into_response());
-    }
-
     let signature_hex = headers
         .get("x-signature")
         .and_then(|v| v.to_str().ok())
@@ -102,6 +92,17 @@ pub async fn verify(
 
     if got.len() != expected.len() || got.ct_eq(&expected).unwrap_u8() == 0 {
         return Err(ApiError::unauthorized("signature mismatch").into_response());
+    }
+
+    // P3 §10.13: defense-in-depth allowlist. Runs *after* HMAC verify
+    // so unauthenticated callers can't enumerate valid svc_ids by
+    // diffing error messages — they'd hit "signature mismatch" first
+    // regardless of whether the svc_id is in the allowlist. Empty
+    // allowlist = check disabled (back-compat for single-tenant).
+    if !state.allowed_service_ids.is_empty()
+        && !state.allowed_service_ids.iter().any(|allowed| allowed == svc_id)
+    {
+        return Err(ApiError::unauthorized("X-Service-Id not in allowlist").into_response());
     }
 
     tracing::debug!(svc_id, "hmac verified");
