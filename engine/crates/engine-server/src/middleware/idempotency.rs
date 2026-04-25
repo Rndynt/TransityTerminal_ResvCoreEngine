@@ -86,10 +86,18 @@ impl IdempotencyStore {
         }))
     }
 
-    /// Insert-or-no-op a cached response. Returns `Ok(true)` if this writer
-    /// won the race (the row was inserted), `Ok(false)` if another writer
-    /// already populated the same key concurrently. The middleware does not
-    /// branch on the result — both outcomes are correct.
+    /// Insert-or-overwrite-expired cached response.
+    ///
+    /// Returns `Ok(true)` if this writer either inserted a new row OR
+    /// successfully overwrote an expired-but-unswept row, `Ok(false)`
+    /// if another active (non-expired) row already exists for the key
+    /// (concurrent winner — its body is already cached).
+    ///
+    /// The `WHERE … expires_at <= now()` clause on the conflict path
+    /// is critical: without it, an expired row would block re-insertion
+    /// for the entire window between TTL expiry and the next reaper
+    /// sweep (`get` filters expired rows so the handler would re-execute
+    /// on every retry, and then `put` would silently no-op).
     pub async fn put(&self, key: &str, value: CachedResponse) -> Result<bool, sqlx::Error> {
         let expires_at: DateTime<Utc> = Utc::now() + chrono::Duration::from_std(self.ttl).unwrap();
         let result = sqlx::query(
@@ -97,7 +105,13 @@ impl IdempotencyStore {
             INSERT INTO engine_idempotency_cache
                    (key, body_hash, status_code, response_body, expires_at)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (key) DO NOTHING
+            ON CONFLICT (key) DO UPDATE
+               SET body_hash     = EXCLUDED.body_hash,
+                   status_code   = EXCLUDED.status_code,
+                   response_body = EXCLUDED.response_body,
+                   expires_at    = EXCLUDED.expires_at,
+                   created_at    = now()
+             WHERE engine_idempotency_cache.expires_at <= now()
             "#,
         )
         .bind(key)
