@@ -79,7 +79,53 @@ async fn main() -> anyhow::Result<()> {
              with TransityTerminal migrations applied."
         );
     }
-    info!("schema fail-fast probe OK (seat_holds, seat_inventory present)");
+
+    // P3 §10.10 — verify the new persistent stores added in v1.0.x
+    // exist and have the expected shape. These are engine-managed, so a
+    // failure here usually means migrations didn't run (e.g. operator
+    // pinned an older binary against a newer DB or vice-versa).
+    if let Err(e) = sqlx::query(
+        "SELECT key, body_hash, status_code, response_body, expires_at \
+           FROM engine_idempotency_cache LIMIT 0",
+    )
+    .execute(&pg_pool)
+    .await
+    {
+        anyhow::bail!(
+            "startup schema check failed on engine_idempotency_cache: {e:#}. \
+             Migration 0002_idempotency_cache.sql may not have run. \
+             Verify DATABASE_URL is correct and migrations are applied."
+        );
+    }
+
+    // Hard-coded contract version that this engine binary requires. Bump
+    // whenever a new migration introduces a hard requirement on a
+    // column/index/table — keep in sync with the value inserted by the
+    // latest schema-version migration.
+    const REQUIRED_SCHEMA_VERSION: &str = "1";
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM engine_schema_meta WHERE key = 'engine_schema_version'",
+    )
+    .fetch_optional(&pg_pool)
+    .await
+    .context("failed to read engine_schema_meta")?;
+    match row {
+        None => anyhow::bail!(
+            "engine_schema_meta has no row for 'engine_schema_version' — \
+             migration 0004_schema_version_marker.sql did not run."
+        ),
+        Some((db_version,)) if db_version != REQUIRED_SCHEMA_VERSION => anyhow::bail!(
+            "engine schema version mismatch: binary expects v{REQUIRED_SCHEMA_VERSION} \
+             but database is at v{db_version}. Pin the matching engine image or \
+             apply the missing migrations."
+        ),
+        Some((db_version,)) => {
+            info!(
+                schema_version = %db_version,
+                "schema fail-fast probe OK (seat_holds, seat_inventory, engine_idempotency_cache, engine_schema_meta)"
+            );
+        }
+    }
 
     // Optional Redis publisher.
     let publisher: std::sync::Arc<dyn engine_core::EventPublisher> = match &cfg.redis_url {
