@@ -3,7 +3,6 @@ use chrono::Utc;
 use deadpool_redis::Pool as RedisPool;
 use redis::AsyncCommands;
 use serde::Serialize;
-use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -105,7 +104,6 @@ pub async fn emit_release_pair<P: EventPublisher + ?Sized>(
 ) -> Result<(), EngineError> {
     let inv = ReservationEvent::inventory_updated(trip_id, seat_no.clone(), leg_indexes);
     publisher.publish(&inv).await?;
-    let _ = json!({}); // keep serde_json import
     let rel = ReservationEvent::holds_released(trip_id, vec![seat_no]);
     publisher.publish(&rel).await?;
     Ok(())
