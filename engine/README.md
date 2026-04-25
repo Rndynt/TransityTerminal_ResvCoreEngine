@@ -70,6 +70,7 @@ comparison via `subtle`.
 | `REDIS_URL`                        | no       | —                | Falls back to NoopPublisher if unset    |
 | `PORT`, `HOST`                     | no       | `8090`, `0.0.0.0`|                                          |
 | `HMAC_SKEW_SECS`                   | no       | `30`             |                                          |
+| `ALLOWED_SERVICE_IDS`              | no       | (unset = open)   | Comma-separated allowlist for `X-Service-Id` (P3 §10.13). |
 | `REAPER_INTERVAL_SECS`             | no       | `60`             |                                          |
 | `DB_MIN_CONN`, `DB_MAX_CONN`       | no       | `10`, `50`       | Per contract §8                         |
 | `IDEMPOTENCY_SWEEP_INTERVAL_SECS`  | no       | `3600`           | Period between sweeps that purge expired idempotency rows. Reads filter `expires_at > now()` regardless. |

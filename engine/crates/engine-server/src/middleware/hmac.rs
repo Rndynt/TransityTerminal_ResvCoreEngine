@@ -42,6 +42,16 @@ pub async fn verify(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::unauthorized("missing X-Service-Id").into_response())?;
 
+    // P3 §10.13: defense-in-depth allowlist. If a partial secret leak
+    // ever occurs, an attacker can't trivially impersonate another
+    // service without also knowing a valid svc_id from the configured
+    // operator list. Empty allowlist = check disabled (back-compat).
+    if !state.allowed_service_ids.is_empty()
+        && !state.allowed_service_ids.iter().any(|allowed| allowed == svc_id)
+    {
+        return Err(ApiError::unauthorized("X-Service-Id not in allowlist").into_response());
+    }
+
     let signature_hex = headers
         .get("x-signature")
         .and_then(|v| v.to_str().ok())

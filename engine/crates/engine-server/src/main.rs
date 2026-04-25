@@ -103,11 +103,21 @@ async fn main() -> anyhow::Result<()> {
     let idempotency =
         std::sync::Arc::new(middleware::idempotency::IdempotencyStore::new(pg_pool.clone()));
 
+    if !cfg.allowed_service_ids.is_empty() {
+        info!(
+            allowlist = ?cfg.allowed_service_ids,
+            "X-Service-Id allowlist enabled"
+        );
+    } else {
+        info!("X-Service-Id allowlist disabled (ALLOWED_SERVICE_IDS unset)");
+    }
+
     let state = AppState {
         pool: pg_pool.clone(),
         publisher: publisher.clone(),
         hmac_secret: cfg.hmac_secret.clone(),
         hmac_skew_secs: cfg.hmac_skew_secs,
+        allowed_service_ids: std::sync::Arc::new(cfg.allowed_service_ids.clone()),
         idempotency,
         ttl_short_secs: cfg.ttl_short_secs,
         ttl_long_secs: cfg.ttl_long_secs,
