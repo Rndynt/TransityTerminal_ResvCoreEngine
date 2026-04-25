@@ -2,6 +2,18 @@
 //!
 //! Event order MUST be `inventory.updated` first, then `holds.released`
 //! (contract §9.7).
+//!
+//! ## Confirm-aware filter (P1 §10.4)
+//!
+//! The SELECT below filters `booking_id IS NULL`, i.e. only **active** holds
+//! are eligible for release. Once a hold has been promoted to a booking via
+//! `confirm_booking`, the row stays in `seat_holds` as an audit trail with
+//! `booking_id` set, and the corresponding `seat_inventory.hold_ref` is
+//! already cleared. A subsequent `release_hold_by_ref(<consumed-hold-ref>)`
+//! must NOT delete the audit row and must NOT emit `inventory.updated` /
+//! `holds.released` events (which would mislead subscribers into thinking
+//! the seat is back on sale). We therefore treat a confirmed hold the same
+//! as a missing hold — return `ReleaseResult { success: false }` silently.
 
 use sqlx::Row;
 use uuid::Uuid;
@@ -22,6 +34,7 @@ pub async fn release_hold_by_ref<P: EventPublisher + ?Sized>(
         SELECT trip_id, seat_no, leg_indexes
           FROM seat_holds
          WHERE hold_ref = $1
+           AND booking_id IS NULL
          FOR UPDATE
         "#,
     )
@@ -30,7 +43,8 @@ pub async fn release_hold_by_ref<P: EventPublisher + ?Sized>(
     .await?;
 
     let Some(row) = hold_row else {
-        // No matching hold — nothing to do, no events.
+        // No matching active hold — either truly absent OR already consumed
+        // by `confirm_booking`. Either way: no row to delete, no events.
         return Ok(ReleaseResult { success: false });
     };
 

@@ -290,6 +290,61 @@ async fn release_missing_hold_returns_false_no_event() {
     assert!(publisher.log.lock().await.is_empty());
 }
 
+// P1 §10.4: a hold that has already been promoted to a booking via
+// `confirm_booking` must NOT be releasable. The audit row stays, the
+// inventory stays booked, and no events fire.
+#[tokio::test]
+async fn release_consumed_hold_returns_false_preserves_audit_and_inventory() {
+    let pool = pool().await;
+    let trip = seed_inventory(&pool, &["17Q"], &[0]).await;
+    let publisher = RecordingPublisher::default();
+
+    let hold = atomic_hold(
+        &pool,
+        &publisher,
+        req(trip, "17Q", vec![0], TtlClass::Short),
+    )
+    .await
+    .unwrap();
+    let AtomicHoldResult::Success { hold_ref, .. } = hold else {
+        panic!("expected success");
+    };
+
+    confirm_booking(&pool, &NoopPublisher, &hold_ref.to_string(), "BK-17Q")
+        .await
+        .unwrap();
+
+    publisher.log.lock().await.clear();
+
+    let r = release_hold_by_ref(&pool, &publisher, &hold_ref.to_string())
+        .await
+        .unwrap();
+    assert!(!r.success, "release of confirmed hold must report success=false");
+    assert!(
+        publisher.log.lock().await.is_empty(),
+        "release of confirmed hold must NOT emit events",
+    );
+
+    // Audit row preserved with booking_id intact.
+    let bk: (Option<String>,) =
+        sqlx::query_as("SELECT booking_id FROM seat_holds WHERE hold_ref = $1")
+            .bind(hold_ref.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bk.0.as_deref(), Some("BK-17Q"));
+
+    // Inventory still booked.
+    let row: (bool, Option<String>) =
+        sqlx::query_as("SELECT booked, hold_ref FROM seat_inventory WHERE trip_id = $1")
+            .bind(trip)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(row.0, "inventory must remain booked after release-of-consumed");
+    assert!(row.1.is_none());
+}
+
 // ───────────────────────────── Confirm flow ───────────────────────────────
 
 #[tokio::test]
